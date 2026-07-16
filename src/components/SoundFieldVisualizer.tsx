@@ -24,6 +24,91 @@ export default function SoundFieldVisualizer({
   const [dimensions, setDimensions] = useState({ width: 400, height: 400 });
   const [isDragging, setIsDragging] = useState(false);
   const [draggedTrackId, setDraggedTrackId] = useState<string | null>(null);
+  const [isKeyboardActive, setIsKeyboardActive] = useState(false);
+
+  // Enter keyboard mode when a track is clicked/selected
+  useEffect(() => {
+    if (selectedTrackId) {
+      setIsKeyboardActive(true);
+    } else {
+      setIsKeyboardActive(false);
+    }
+  }, [selectedTrackId]);
+
+  // Click away to dismiss keyboard mode
+  useEffect(() => {
+    const handleOutsideClick = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setIsKeyboardActive(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+    };
+  }, []);
+
+  // Listen to keyboard inputs to adjust positions
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!isKeyboardActive || !selectedTrackId) return;
+
+      // Ignore arrow presses if focused in standard input/textarea controls
+      const activeEl = document.activeElement;
+      if (
+        activeEl &&
+        (activeEl.tagName === "INPUT" ||
+          activeEl.tagName === "TEXTAREA" ||
+          activeEl.tagName === "SELECT")
+      ) {
+        return;
+      }
+
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+        e.preventDefault(); // Stop page scrolling
+
+        const track = tracks.find((t) => t.id === selectedTrackId);
+        if (!track) return;
+
+        let newX = track.x;
+        let newY = track.y;
+        let newZ = track.z;
+        const step = 0.1;
+
+        if (viewMode === "top") {
+          // TOP-DOWN: Left/Right affects X, Up/Down affects Z
+          if (e.key === "ArrowLeft") {
+            newX = Math.max(newX - step, -5);
+          } else if (e.key === "ArrowRight") {
+            newX = Math.min(newX + step, 5);
+          } else if (e.key === "ArrowUp") {
+            newZ = Math.max(newZ - step, -5); // UP is forward (negative Z)
+          } else if (e.key === "ArrowDown") {
+            newZ = Math.min(newZ + step, 5);  // DOWN is backward (positive Z)
+          }
+        } else {
+          // FRONT VIEW: Left/Right affects X, Up/Down affects Y
+          if (e.key === "ArrowLeft") {
+            newX = Math.max(newX - step, -5);
+          } else if (e.key === "ArrowRight") {
+            newX = Math.min(newX + step, 5);
+          } else if (e.key === "ArrowUp") {
+            newY = Math.min(newY + step, 5);  // UP is height (positive Y)
+          } else if (e.key === "ArrowDown") {
+            newY = Math.max(newY - step, -5); // DOWN is negative Y
+          }
+        }
+
+        onUpdateTrackPosition(selectedTrackId, newX, newY, newZ);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isKeyboardActive, selectedTrackId, tracks, viewMode, onUpdateTrackPosition]);
 
   // Soundwave ripple states
   const ripplesRef = useRef<Record<string, number[]>>({});
@@ -373,7 +458,13 @@ export default function SoundFieldVisualizer({
       </div>
 
       {/* Actual Canvas */}
-      <div className="relative border border-bento-border rounded-2xl overflow-hidden shadow-2xl bg-bento-bg">
+      <div
+        className={`relative border rounded-2xl overflow-hidden bg-bento-bg transition-all duration-300 ${
+          isKeyboardActive
+            ? "border-bento-accent ring-2 ring-bento-accent/35 shadow-[0_0_25px_rgba(0,255,136,0.3)] visualizer-keyboard-mode"
+            : "border-bento-border shadow-2xl"
+        }`}
+      >
         <canvas
           ref={canvasRef}
           width={dimensions.width}
@@ -387,9 +478,13 @@ export default function SoundFieldVisualizer({
         />
 
         {/* Tip overlay */}
-        <div className="absolute bottom-3 left-3 flex items-center gap-1.5 bg-bento-card/90 backdrop-blur-md border border-bento-border px-2.5 py-1 rounded-md text-[10px] text-bento-text/80">
-          <HelpCircle className="w-3.5 h-3.5 text-bento-accent" />
-          <span className="font-mono text-[9px] uppercase tracking-wider">Drag nodes to position sound field</span>
+        <div className="absolute bottom-3 left-3 flex items-center gap-1.5 bg-bento-card/90 backdrop-blur-md border border-bento-border px-2.5 py-1 rounded-md text-[10px] text-bento-text/80 transition-all duration-200">
+          <HelpCircle className={`w-3.5 h-3.5 ${isKeyboardActive ? "text-bento-accent animate-pulse" : "text-bento-accent"}`} />
+          <span className="font-mono text-[9px] uppercase tracking-wider">
+            {isKeyboardActive
+              ? "Arrow keys active (±0.1m) • Click outside to exit"
+              : "Drag nodes to position sound field"}
+          </span>
         </div>
       </div>
     </div>

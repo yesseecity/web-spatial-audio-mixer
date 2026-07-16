@@ -33,6 +33,7 @@ export default function DesktopController() {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playing, setPlaying] = useState(false);
   const [masterVolume, setMasterVolume] = useState(0.8);
+  const [desktopVolume, setDesktopVolume] = useState(0.0); // start muted by default to avoid echo/duplication unless intended
   const [listenerOrientation, setListenerOrientation] = useState<[number, number, number, number, number, number]>([0, 0, -1, 0, 1, 0]);
   const [rotationAngle, setRotationAngle] = useState(0); // head rotation angle (yaw) in degrees
   const [mobileConnected, setMobileConnected] = useState(false);
@@ -40,6 +41,23 @@ export default function DesktopController() {
   const [isQrOpen, setIsQrOpen] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
+
+  // Web Audio Context & Gain Nodes for Desktop Audio Spatialization
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const masterGainRef = useRef<GainNode | null>(null);
+  const trackAudioMapRef = useRef<
+    Record<
+      string,
+      {
+        panner: PannerNode;
+        gainNode: GainNode;
+        oscillatorSource?: OscillatorNode;
+        bufferSource?: AudioBufferSourceNode;
+        buffer?: AudioBuffer;
+        envelopeTimer?: any;
+      }
+    >
+  >({});
 
   // Initialize Room ID and Socket Connection
   useEffect(() => {
@@ -99,8 +117,375 @@ export default function DesktopController() {
 
     return () => {
       socket.disconnect();
+      // Clean up all local audio context nodes on unmount
+      Object.keys(trackAudioMapRef.current).forEach((trackId) => {
+        stopAndDestroyLocalTrack(trackId);
+      });
+      if (audioCtxRef.current) {
+        audioCtxRef.current.close();
+      }
     };
   }, []);
+
+  // Convert Base64 file format to ArrayBuffer for Web Audio Decoding
+  const base64ToArrayBuffer = (base64: string): ArrayBuffer => {
+    const base64Clean = base64.includes("base64,") ? base64.split("base64,")[1] : base64;
+    const binaryString = window.atob(base64Clean);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes.buffer;
+  };
+
+  const startLocalFileSource = (trackId: string, buffer: AudioBuffer) => {
+    const ctx = audioCtxRef.current;
+    const mapItem = trackAudioMapRef.current[trackId];
+    if (!ctx || !mapItem || !buffer) return;
+
+    if (mapItem.bufferSource) {
+      try {
+        mapItem.bufferSource.stop();
+      } catch (e) {}
+    }
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    source.connect(mapItem.gainNode);
+    source.start();
+
+    mapItem.bufferSource = source;
+  };
+
+  const startLocalSynthSource = (trackId: string, synthType: "pad" | "lead" | "beat" | "drone") => {
+    const ctx = audioCtxRef.current;
+    const mapItem = trackAudioMapRef.current[trackId];
+    if (!ctx || !mapItem) return;
+
+    if (mapItem.oscillatorSource) {
+      try {
+        mapItem.oscillatorSource.stop();
+      } catch (e) {}
+    }
+
+    if (synthType === "pad") {
+      const osc = ctx.createOscillator();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(196, ctx.currentTime);
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.frequency.setValueAtTime(800, ctx.currentTime);
+
+      const lfo = ctx.createOscillator();
+      lfo.type = "sine";
+      lfo.frequency.setValueAtTime(0.2, ctx.currentTime);
+      const lfoGain = ctx.createGain();
+      lfoGain.gain.setValueAtTime(400, ctx.currentTime);
+
+      lfo.connect(lfoGain);
+      lfoGain.connect(filter.frequency);
+      lfo.start();
+
+      osc.connect(filter);
+      filter.connect(mapItem.gainNode);
+      osc.start();
+
+      mapItem.oscillatorSource = osc;
+
+      let padInterval = setInterval(() => {
+        if (!audioCtxRef.current) {
+          clearInterval(padInterval);
+          return;
+        }
+        const chordFreqs = [196.0, 220.0, 261.6, 329.6];
+        const nextFreq = chordFreqs[Math.floor(Math.random() * chordFreqs.length)];
+        osc.frequency.setTargetAtTime(nextFreq, ctx.currentTime, 3.5);
+      }, 7000);
+      mapItem.envelopeTimer = padInterval;
+
+    } else if (synthType === "lead") {
+      const osc = ctx.createOscillator();
+      osc.type = "sawtooth";
+      osc.frequency.setValueAtTime(329.6, ctx.currentTime);
+
+      const bandpass = ctx.createBiquadFilter();
+      bandpass.type = "bandpass";
+      bandpass.frequency.setValueAtTime(1200, ctx.currentTime);
+      bandpass.Q.setValueAtTime(2, ctx.currentTime);
+
+      const delay = ctx.createDelay();
+      delay.delayTime.setValueAtTime(0.3, ctx.currentTime);
+      const delayGain = ctx.createGain();
+      delayGain.gain.setValueAtTime(0.35, ctx.currentTime);
+
+      osc.connect(bandpass);
+      bandpass.connect(mapItem.gainNode);
+
+      bandpass.connect(delay);
+      delay.connect(delayGain);
+      delayGain.connect(delay);
+      delayGain.connect(mapItem.gainNode);
+
+      osc.start();
+      mapItem.oscillatorSource = osc;
+
+      const pentatonic = [392.0, 440.0, 523.2, 587.3, 659.3, 784.0];
+      let step = 0;
+      let arpInterval = setInterval(() => {
+        if (!audioCtxRef.current || !playing) return;
+        const trackState = tracks.find((t) => t.id === trackId);
+        if (trackState && trackState.playing && trackState.volume > 0.05) {
+          const targetFreq = pentatonic[step % pentatonic.length];
+          osc.frequency.setValueAtTime(targetFreq, ctx.currentTime);
+          bandpass.frequency.setValueAtTime(1600, ctx.currentTime);
+          bandpass.frequency.exponentialRampToValueAtTime(300, ctx.currentTime + 0.2);
+          step++;
+        }
+      }, 300);
+
+      mapItem.envelopeTimer = arpInterval;
+
+    } else if (synthType === "drone") {
+      const osc1 = ctx.createOscillator();
+      osc1.type = "sawtooth";
+      osc1.frequency.setValueAtTime(55.0, ctx.currentTime);
+
+      const osc2 = ctx.createOscillator();
+      osc2.type = "triangle";
+      osc2.frequency.setValueAtTime(110.5, ctx.currentTime);
+
+      const lowpass = ctx.createBiquadFilter();
+      lowpass.type = "lowpass";
+      lowpass.frequency.setValueAtTime(120, ctx.currentTime);
+
+      osc1.connect(lowpass);
+      osc2.connect(lowpass);
+      lowpass.connect(mapItem.gainNode);
+
+      osc1.start();
+      osc2.start();
+
+      mapItem.oscillatorSource = osc1;
+
+    } else if (synthType === "beat") {
+      const bufferSize = ctx.sampleRate * 2;
+      const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+      const output = noiseBuffer.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) {
+        output[i] = Math.random() * 2 - 1;
+      }
+
+      let beatInterval = setInterval(() => {
+        if (!audioCtxRef.current || !playing) return;
+        const trackState = tracks.find((t) => t.id === trackId);
+        if (trackState && trackState.playing) {
+          const noiseSource = ctx.createBufferSource();
+          noiseSource.buffer = noiseBuffer;
+
+          const filter = ctx.createBiquadFilter();
+          filter.type = "highpass";
+          filter.frequency.setValueAtTime(7000, ctx.currentTime);
+
+          const env = ctx.createGain();
+          env.gain.setValueAtTime(1, ctx.currentTime);
+          env.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.05);
+
+          noiseSource.connect(filter);
+          filter.connect(env);
+          env.connect(mapItem.gainNode);
+          noiseSource.start();
+        }
+      }, 500);
+
+      mapItem.envelopeTimer = beatInterval;
+    }
+  };
+
+  const initializeLocalAudioTrack = async (track: Track) => {
+    const ctx = audioCtxRef.current;
+    const masterGain = masterGainRef.current;
+    if (!ctx || !masterGain) return;
+
+    if (trackAudioMapRef.current[track.id]) return;
+
+    const panner = ctx.createPanner();
+    panner.panningModel = "HRTF";
+    panner.distanceModel = "inverse";
+    panner.refDistance = 1.0;
+    panner.maxDistance = 100.0;
+    panner.rolloffFactor = 1.0;
+    panner.coneInnerAngle = 360;
+    panner.coneOuterAngle = 360;
+
+    panner.positionX.setValueAtTime(track.x, ctx.currentTime);
+    panner.positionY.setValueAtTime(track.y, ctx.currentTime);
+    panner.positionZ.setValueAtTime(track.z, ctx.currentTime);
+
+    const gainNode = ctx.createGain();
+    const targetVolume = track.playing && playing ? track.volume : 0;
+    gainNode.gain.setValueAtTime(targetVolume, ctx.currentTime);
+
+    gainNode.connect(panner);
+    panner.connect(masterGain);
+
+    trackAudioMapRef.current[track.id] = {
+      panner,
+      gainNode,
+    };
+
+    if (track.type === "synth") {
+      startLocalSynthSource(track.id, track.synthType || "pad");
+    } else if (track.type === "file" && track.fileData) {
+      try {
+        const arrayBuffer = base64ToArrayBuffer(track.fileData);
+        ctx.decodeAudioData(
+          arrayBuffer,
+          (decodedBuffer) => {
+            if (!trackAudioMapRef.current[track.id]) return;
+            trackAudioMapRef.current[track.id].buffer = decodedBuffer;
+            if (playing && track.playing) {
+              startLocalFileSource(track.id, decodedBuffer);
+            }
+          },
+          (err) => console.error("Error decoding audio on desktop:", err)
+        );
+      } catch (err) {
+        console.error("Failed base64 decode on desktop:", err);
+      }
+    }
+  };
+
+  const stopAndDestroyLocalTrack = (trackId: string) => {
+    const mapItem = trackAudioMapRef.current[trackId];
+    if (!mapItem) return;
+
+    if (mapItem.oscillatorSource) {
+      try { mapItem.oscillatorSource.stop(); } catch (e) {}
+    }
+    if (mapItem.bufferSource) {
+      try { mapItem.bufferSource.stop(); } catch (e) {}
+    }
+    if (mapItem.envelopeTimer) {
+      clearInterval(mapItem.envelopeTimer);
+    }
+
+    try { mapItem.gainNode.disconnect(); } catch (e) {}
+    try { mapItem.panner.disconnect(); } catch (e) {}
+
+    delete trackAudioMapRef.current[trackId];
+  };
+
+  // Helper to lazily initialize Desktop Audio Context on any user interaction or slider change
+  const ensureLocalAudioContext = async () => {
+    if (audioCtxRef.current) {
+      if (audioCtxRef.current.state === "suspended") {
+        await audioCtxRef.current.resume();
+      }
+      return;
+    }
+
+    try {
+      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new AudioCtxClass();
+      audioCtxRef.current = ctx;
+
+      const masterGain = ctx.createGain();
+      masterGain.gain.setValueAtTime(desktopVolume, ctx.currentTime);
+      masterGainRef.current = masterGain;
+
+      masterGain.connect(ctx.destination);
+
+      // Initialize all currently existing tracks locally
+      tracks.forEach((track) => {
+        initializeLocalAudioTrack(track);
+      });
+    } catch (err) {
+      console.error("Failed to initialize local desktop audio context:", err);
+    }
+  };
+
+  // Synchronize local Web Audio nodes with state changes
+  useEffect(() => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+
+    // Update master gain
+    if (masterGainRef.current) {
+      masterGainRef.current.gain.setTargetAtTime(desktopVolume, ctx.currentTime, 0.05);
+    }
+
+    // Update listener orientation based on rotationAngle
+    if (ctx.listener) {
+      const yawRad = (rotationAngle * Math.PI) / 180;
+      const forwardX = Math.sin(yawRad);
+      const forwardY = 0;
+      const forwardZ = -Math.cos(yawRad);
+      const t = ctx.currentTime;
+      if (ctx.listener.forwardX) {
+        ctx.listener.forwardX.setTargetAtTime(forwardX, t, 0.04);
+        ctx.listener.forwardY.setTargetAtTime(forwardY, t, 0.04);
+        ctx.listener.forwardZ.setTargetAtTime(forwardZ, t, 0.04);
+        ctx.listener.upX.setTargetAtTime(0, t, 0.04);
+        ctx.listener.upY.setTargetAtTime(1, t, 0.04);
+        ctx.listener.upZ.setTargetAtTime(0, t, 0.04);
+      } else {
+        ctx.listener.setOrientation(forwardX, 0, forwardZ, 0, 1, 0);
+      }
+    }
+
+    // Sync individual track parameters
+    tracks.forEach((track) => {
+      const mapItem = trackAudioMapRef.current[track.id];
+      if (!mapItem) {
+        initializeLocalAudioTrack(track);
+      } else {
+        const timeConstant = 0.06;
+        mapItem.panner.positionX.setTargetAtTime(track.x, ctx.currentTime, timeConstant);
+        mapItem.panner.positionY.setTargetAtTime(track.y, ctx.currentTime, timeConstant);
+        mapItem.panner.positionZ.setTargetAtTime(track.z, ctx.currentTime, timeConstant);
+
+        const targetVolume = track.playing && playing ? track.volume : 0;
+        mapItem.gainNode.gain.setTargetAtTime(targetVolume, ctx.currentTime, 0.04);
+
+        if (playing) {
+          if (track.playing) {
+            if (track.type === "file" && mapItem.buffer && !mapItem.bufferSource) {
+              startLocalFileSource(track.id, mapItem.buffer);
+            }
+          } else {
+            if (track.type === "file" && mapItem.bufferSource) {
+              try {
+                mapItem.bufferSource.stop();
+              } catch (e) {}
+              mapItem.bufferSource = undefined;
+            }
+          }
+        } else {
+          if (track.type === "file" && mapItem.bufferSource) {
+            try {
+              mapItem.bufferSource.stop();
+            } catch (e) {}
+            mapItem.bufferSource = undefined;
+          }
+          if (track.type === "synth" && mapItem.envelopeTimer) {
+            clearInterval(mapItem.envelopeTimer);
+            mapItem.envelopeTimer = undefined;
+          }
+        }
+      }
+    });
+
+    // Handle deletions
+    Object.keys(trackAudioMapRef.current).forEach((trackId) => {
+      const stillExists = tracks.some((t) => t.id === trackId);
+      if (!stillExists) {
+        stopAndDestroyLocalTrack(trackId);
+      }
+    });
+  }, [tracks, playing, desktopVolume, rotationAngle]);
 
   // Update track volume
   const handleUpdateTrackVolume = (trackId: string, volume: number) => {
@@ -152,15 +537,26 @@ export default function DesktopController() {
       roomId,
       updates: { playing: nextPlaying },
     });
+    if (nextPlaying) {
+      ensureLocalAudioContext();
+    }
   };
 
-  // Master volume change
+  // Master mobile volume change
   const handleMasterVolumeChange = (volume: number) => {
     setMasterVolume(volume);
     socketRef.current?.emit("update-room", {
       roomId,
       updates: { masterVolume: volume },
     });
+  };
+
+  // Local desktop volume change
+  const handleDesktopVolumeChange = (volume: number) => {
+    setDesktopVolume(volume);
+    if (volume > 0) {
+      ensureLocalAudioContext();
+    }
   };
 
   // Handle selected track coordinate changes via manual sliders
@@ -401,26 +797,26 @@ export default function DesktopController() {
 
       {/* 3. Global Master Controls Bar (Sticky Footer) */}
       <footer className="border-t border-bento-border bg-bento-card/85 backdrop-blur-md py-5 px-6 sticky bottom-0 z-10 shadow-[0_-8px_24px_rgba(0,0,0,0.5)]">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center gap-5 justify-between">
+        <div className="max-w-7xl mx-auto flex flex-col lg:flex-row items-center gap-5 justify-between">
           {/* Guide Note */}
-          <div className="flex items-center gap-3">
-            <Smartphone className="w-5 h-5 text-bento-accent shrink-0" />
+          <div className="flex items-center gap-3 max-w-md">
+            <Smartphone className="w-5 h-5 text-bento-accent shrink-0 animate-pulse" />
             <div className="text-left">
               <p className="text-xs font-semibold text-bento-text">
-                Need to hear the spatial effects?
+                Dual-Output Monitoring Active
               </p>
               <p className="text-[10px] text-bento-muted leading-relaxed">
-                This desktop serves as the visual master. Make sure to pair and open the <span className="text-bento-accent font-semibold">Mobile Player</span> on a phone with stereo headphones.
+                Connect a phone for head-tracked <span className="text-bento-accent font-semibold">Mobile Player</span> spatial effects, or unmute the <span className="text-bento-accent font-semibold">Desktop Monitor</span> to experience immersive spatial audio directly!
               </p>
             </div>
           </div>
 
           {/* Master Volume and Global Play Controls */}
-          <div className="flex items-center gap-6 w-full md:w-auto">
+          <div className="flex flex-col sm:flex-row items-center gap-4 w-full lg:w-auto">
             {/* Global Play / Pause */}
             <button
               onClick={handleToggleMasterPlay}
-              className={`flex items-center justify-center gap-2 p-3 px-6 rounded-xl text-xs font-mono font-bold uppercase tracking-wider shadow-lg transition-all cursor-pointer ${
+              className={`w-full sm:w-auto flex items-center justify-center gap-2.5 p-3 px-5 rounded-xl text-xs font-mono font-bold uppercase tracking-wider shadow-lg transition-all cursor-pointer shrink-0 ${
                 playing
                   ? "bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white shadow-rose-600/10"
                   : "bg-bento-accent hover:opacity-90 active:opacity-100 text-bento-bg shadow-bento-accent/15"
@@ -429,23 +825,42 @@ export default function DesktopController() {
               {playing ? (
                 <>
                   <Pause className="w-4 h-4 fill-white" />
-                  <span>Pause Sound Field</span>
+                  <span>Pause Stage</span>
                 </>
               ) : (
                 <>
                   <Play className="w-4 h-4 fill-bento-bg" />
-                  <span>Play Sound Field</span>
+                  <span>Play Stage</span>
                 </>
               )}
             </button>
 
-            {/* Master Volume */}
-            <div className="flex items-center gap-3 bg-bento-bg border border-bento-border p-2.5 px-4 rounded-xl flex-1 md:w-64 max-w-xs md:flex-initial">
-              {masterVolume === 0 ? (
-                <VolumeX className="w-4 h-4 text-bento-muted shrink-0" />
-              ) : (
-                <Volume2 className="w-4 h-4 text-bento-accent shrink-0" />
-              )}
+            {/* Desktop Volume */}
+            <div className="flex items-center gap-2 bg-bento-bg border border-bento-border p-2.5 px-3.5 rounded-xl w-full sm:w-52 max-w-xs sm:flex-initial group">
+              <div className="flex items-center gap-1.5 text-bento-muted group-hover:text-bento-accent transition-colors shrink-0">
+                <Laptop className="w-3.5 h-3.5 shrink-0" />
+                <span className="text-[9px] font-mono font-bold uppercase tracking-wider">Desktop</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="1.0"
+                step="0.01"
+                value={desktopVolume}
+                onChange={(e) => handleDesktopVolumeChange(parseFloat(e.target.value))}
+                className="w-full h-1 bg-bento-border rounded-lg appearance-none cursor-pointer accent-bento-accent focus:outline-none"
+              />
+              <span className="text-[10px] font-mono font-bold text-bento-text w-9 text-right shrink-0">
+                {desktopVolume === 0 ? "MUTE" : `${Math.round(desktopVolume * 100)}%`}
+              </span>
+            </div>
+
+            {/* Mobile Volume */}
+            <div className="flex items-center gap-2 bg-bento-bg border border-bento-border p-2.5 px-3.5 rounded-xl w-full sm:w-52 max-w-xs sm:flex-initial group">
+              <div className="flex items-center gap-1.5 text-bento-muted group-hover:text-bento-accent transition-colors shrink-0">
+                <Smartphone className="w-3.5 h-3.5 shrink-0" />
+                <span className="text-[9px] font-mono font-bold uppercase tracking-wider">Mobile</span>
+              </div>
               <input
                 type="range"
                 min="0"
@@ -455,8 +870,8 @@ export default function DesktopController() {
                 onChange={(e) => handleMasterVolumeChange(parseFloat(e.target.value))}
                 className="w-full h-1 bg-bento-border rounded-lg appearance-none cursor-pointer accent-bento-accent focus:outline-none"
               />
-              <span className="text-xs font-mono font-bold text-bento-text w-8 text-right shrink-0">
-                {Math.round(masterVolume * 100)}%
+              <span className="text-[10px] font-mono font-bold text-bento-text w-9 text-right shrink-0">
+                {masterVolume === 0 ? "MUTE" : `${Math.round(masterVolume * 100)}%`}
               </span>
             </div>
           </div>

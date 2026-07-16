@@ -25,14 +25,31 @@ export default function MobilePlayer() {
   const [sensorPermission, setSensorPermission] = useState<"default" | "granted" | "denied">("default");
   const [rotation, setRotation] = useState<DeviceRotation>({ alpha: 0, beta: 0, gamma: 0 });
   const [calibrationAngle, setCalibrationAngle] = useState(0); // center orientation offset
+  const calibrationAngleRef = useRef(0);
+  const rawAlphaRef = useRef(0);
+  const isFirstReadingRef = useRef(true);
 
-  const [tracks, setTracks] = useState<Track[]>([]);
+  const [tracks, setTracks] = useState<Track[]>([
+    { id: "track-1", name: "Cosmic Pad", x: -2.5, y: 1.0, z: -2.0, volume: 0.8, playing: true, color: "#8b5cf6", icon: "Waves", type: "synth", synthType: "pad" },
+    { id: "track-2", name: "Arp Pulsar", x: 2.5, y: -0.5, z: -1.5, volume: 0.6, playing: true, color: "#ec4899", icon: "Activity", type: "synth", synthType: "lead" },
+    { id: "track-3", name: "Deep Drone", x: 0.0, y: -2.0, z: -3.5, volume: 0.7, playing: true, color: "#eab308", icon: "Mic", type: "synth", synthType: "drone" },
+    { id: "track-4", name: "Techno Click", x: -1.0, y: -1.5, z: 2.5, volume: 0.5, playing: false, color: "#06b6d4", icon: "Disc", type: "synth", synthType: "beat" }
+  ]);
 
   // Web Audio refs
   const audioCtxRef = useRef<AudioContext | null>(null);
   const masterGainRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const socketRef = useRef<Socket | null>(null);
+
+  // Live mutable refs to avoid stale React closures in listeners/intervals
+  const tracksRef = useRef<Track[]>([
+    { id: "track-1", name: "Cosmic Pad", x: -2.5, y: 1.0, z: -2.0, volume: 0.8, playing: true, color: "#8b5cf6", icon: "Waves", type: "synth", synthType: "pad" },
+    { id: "track-2", name: "Arp Pulsar", x: 2.5, y: -0.5, z: -1.5, volume: 0.6, playing: true, color: "#ec4899", icon: "Activity", type: "synth", synthType: "lead" },
+    { id: "track-3", name: "Deep Drone", x: 0.0, y: -2.0, z: -3.5, volume: 0.7, playing: true, color: "#eab308", icon: "Mic", type: "synth", synthType: "drone" },
+    { id: "track-4", name: "Techno Click", x: -1.0, y: -1.5, z: 2.5, volume: 0.5, playing: false, color: "#06b6d4", icon: "Disc", type: "synth", synthType: "beat" }
+  ]);
+  const isPlayingRef = useRef<boolean>(false);
 
   // Reference map for track audio sources and panning structures
   // Key: trackId
@@ -78,6 +95,9 @@ export default function MobilePlayer() {
 
     socket.on("room-state", (state: RoomState) => {
       console.log("[Mobile] Full room state synced:", state);
+      tracksRef.current = state.tracks;
+      isPlayingRef.current = state.playing;
+
       setTracks(state.tracks);
       setIsPlaying(state.playing);
       setMasterVolume(state.masterVolume);
@@ -94,6 +114,7 @@ export default function MobilePlayer() {
         if (index !== -1) {
           const updated = [...prev];
           updated[index] = { ...updated[index], ...updates };
+          tracksRef.current = updated;
 
           // Real-time track-level parameters update
           if (audioCtxRef.current) {
@@ -103,6 +124,7 @@ export default function MobilePlayer() {
         } else if (updates.id) {
           // Dynamic custom track added
           const updated = [...prev, updates as Track];
+          tracksRef.current = updated;
           if (audioCtxRef.current) {
             initializeAudioTrack(updates as Track);
           }
@@ -114,6 +136,7 @@ export default function MobilePlayer() {
 
     socket.on("room-updated", (updates) => {
       if (updates.playing !== undefined) {
+        isPlayingRef.current = updates.playing;
         setIsPlaying(updates.playing);
         if (audioCtxRef.current) {
           toggleGlobalPlayback(updates.playing);
@@ -149,11 +172,19 @@ export default function MobilePlayer() {
   const startAudioEngine = async () => {
     if (audioContextActive) return;
 
+    // Reset calibration on start so the very first reading defines the front direction
+    isFirstReadingRef.current = true;
+
     try {
       // 1. Initialize Audio Context
       const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
       const ctx = new AudioCtxClass();
       audioCtxRef.current = ctx;
+
+      // Resume context immediately on user gesture to unlock mobile browsers
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
 
       // 2. Setup Master Gain and Analyser
       const masterGain = ctx.createGain();
@@ -176,17 +207,12 @@ export default function MobilePlayer() {
       socketRef.current?.emit("player-ready", { roomId });
 
       // Initialize all tracks
-      for (const track of tracks) {
+      for (const track of tracksRef.current) {
         await initializeAudioTrack(track);
       }
 
-      // Resume context if suspended (browser behavior)
-      if (ctx.state === "suspended") {
-        await ctx.resume();
-      }
-
       // Set global playback state
-      toggleGlobalPlayback(isPlaying);
+      toggleGlobalPlayback(isPlayingRef.current);
 
       console.log("[Mobile] Spatial Audio Engine active and connected.");
     } catch (err) {
@@ -223,7 +249,7 @@ export default function MobilePlayer() {
 
     // 2. Create channel level gain node
     const gainNode = ctx.createGain();
-    const targetVolume = track.playing && isPlaying ? track.volume : 0;
+    const targetVolume = track.playing && isPlayingRef.current ? track.volume : 0;
     gainNode.gain.setValueAtTime(targetVolume, ctx.currentTime);
 
     // Route: [Source] -> GainNode -> Panner -> MasterGain
@@ -245,7 +271,7 @@ export default function MobilePlayer() {
           arrayBuffer,
           (decodedBuffer) => {
             trackAudioMapRef.current[track.id].buffer = decodedBuffer;
-            if (isPlaying && track.playing) {
+            if (isPlayingRef.current && track.playing) {
               startFileSource(track.id, decodedBuffer);
             }
           },
@@ -345,10 +371,10 @@ export default function MobilePlayer() {
       const pentatonic = [392.0, 440.0, 523.2, 587.3, 659.3, 784.0]; // G4, A4, C5, D5, E5, G5
       let step = 0;
       let arpInterval = setInterval(() => {
-        if (!audioCtxRef.current || !isPlaying) return;
+        if (!audioCtxRef.current || !isPlayingRef.current) return;
         
         // Grab current gain state to only play note triggers if track is active and audible
-        const trackState = tracks.find((t) => t.id === trackId);
+        const trackState = tracksRef.current.find((t) => t.id === trackId);
         if (trackState && trackState.playing && trackState.volume > 0.05) {
           const targetFreq = pentatonic[step % pentatonic.length];
           osc.frequency.setValueAtTime(targetFreq, ctx.currentTime);
@@ -398,9 +424,9 @@ export default function MobilePlayer() {
 
       // Interval trigger beat loop (every 500ms -> 120bpm click)
       let beatInterval = setInterval(() => {
-        if (!audioCtxRef.current || !isPlaying) return;
+        if (!audioCtxRef.current || !isPlayingRef.current) return;
 
-        const trackState = tracks.find((t) => t.id === trackId);
+        const trackState = tracksRef.current.find((t) => t.id === trackId);
         if (trackState && trackState.playing) {
           // Play click noise transient
           const noiseSource = ctx.createBufferSource();
@@ -465,11 +491,11 @@ export default function MobilePlayer() {
     mapItem.panner.positionZ.setTargetAtTime(track.z, ctx.currentTime, timeConstant);
 
     // Apply track volume envelope
-    const targetVolume = track.playing && isPlaying ? track.volume : 0;
+    const targetVolume = track.playing && isPlayingRef.current ? track.volume : 0;
     mapItem.gainNode.gain.setTargetAtTime(targetVolume, ctx.currentTime, 0.04);
 
     // If play status toggled while globally running, make sure to start sources if needed
-    if (isPlaying) {
+    if (isPlayingRef.current) {
       if (track.playing) {
         if (track.type === "file" && mapItem.buffer && !mapItem.bufferSource) {
           startFileSource(track.id, mapItem.buffer);
@@ -508,7 +534,11 @@ export default function MobilePlayer() {
     mapItem.panner.disconnect();
 
     delete trackAudioMapRef.current[trackId];
-    setTracks((prev) => prev.filter((t) => t.id !== trackId));
+    setTracks((prev) => {
+      const filtered = prev.filter((t) => t.id !== trackId);
+      tracksRef.current = filtered;
+      return filtered;
+    });
   };
 
   // Sync entire state on room load
@@ -534,7 +564,7 @@ export default function MobilePlayer() {
     const ctx = audioCtxRef.current;
     if (!ctx) return;
 
-    tracks.forEach((track) => {
+    tracksRef.current.forEach((track) => {
       const mapItem = trackAudioMapRef.current[track.id];
       if (!mapItem) return;
 
@@ -574,8 +604,16 @@ export default function MobilePlayer() {
       const beta = e.beta !== null ? e.beta : 0;
       const gamma = e.gamma !== null ? e.gamma : 0;
 
-      // Center calibration calculations
-      const calibratedAlpha = (alpha - calibrationAngle + 360) % 360;
+      rawAlphaRef.current = alpha;
+
+      if (isFirstReadingRef.current) {
+        calibrationAngleRef.current = alpha;
+        setCalibrationAngle(alpha);
+        isFirstReadingRef.current = false;
+      }
+
+      // Center calibration calculations using ref to avoid stale closure state
+      const calibratedAlpha = (alpha - calibrationAngleRef.current + 360) % 360;
 
       setRotation({ alpha: calibratedAlpha, beta, gamma });
 
@@ -637,8 +675,9 @@ export default function MobilePlayer() {
 
   // Reset/Calibrate Orientation yaw offset
   const handleCalibrate = () => {
-    // Uncalibrated raw alpha acts as the center baseline offset
-    setCalibrationAngle(rotation.alpha);
+    const rawAlpha = rawAlphaRef.current;
+    calibrationAngleRef.current = rawAlpha;
+    setCalibrationAngle(rawAlpha);
   };
 
   return (
