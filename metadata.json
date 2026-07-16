@@ -1,0 +1,6 @@
+{
+  "name": "3D Spatial Audio Mixer",
+  "description": "An interactive 3D Spatial Audio Mixer with real-time multi-device synchronization. Control tracks, volume, and coordinates in 3D space on desktop while rendering spatialized HRTF 3D audio on mobile, with head tracking orientation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
